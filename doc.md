@@ -2,6 +2,16 @@
 
 
 
+### 小模型
+
+model = Qwen/Qwen3-8B
+
+extra_body = {
+    enable_thinking: false
+}
+
+
+
 ### 前缀续写
 ​
 1. 使用场景

@@ -116,7 +116,8 @@ class BlastOffLLM:
         self.large_model_config = {
             "api_key": os.getenv("LARGE_MODEL_API_KEY", "your-large-model-api-key"),
             "base_url": os.getenv("LARGE_MODEL_BASE_URL", "https://api.siliconflow.cn/v1"),
-            "model": os.getenv("LARGE_MODEL_NAME", "deepseek-ai/DeepSeek-V2.5")
+            "model": os.getenv("LARGE_MODEL_NAME", "deepseek-ai/DeepSeek-V2.5"),
+            "supports_prefix": os.getenv("LARGE_MODEL_SUPPORTS_PREFIX", "true").lower() == "true"
         }
 
         # Initialize clients
@@ -213,8 +214,17 @@ class BlastOffLLM:
             extra_body = {
                 "enable_thinking": False
             }
+            
+            # Handle prefix based on model capability
             if prefix:
-                extra_body["prefix"] = prefix
+                if self.large_model_config.get("supports_prefix", True):
+                    # Use native prefix feature if supported
+                    extra_body["prefix"] = prefix
+                else:
+                    # Fallback: Add prefix as assistant message for continuation
+                    enhanced_messages.append({"role": "assistant", "content": prefix})
+                    # Add a hint in system message for smooth continuation
+                    enhanced_messages[0]["content"] += f"\n继续前面的回答，前面已经说了：'{prefix}'，请自然地继续补充完整。"
 
             response = await self.large_client.chat.completions.create(
                 model=self.large_model_config["model"],
@@ -268,8 +278,17 @@ class BlastOffLLM:
             ] + [msg.dict() for msg in messages]
 
             extra_body = {}
+            
+            # Handle prefix based on model capability
             if quick_response and not disable_quick:
-                extra_body["prefix"] = quick_response
+                if self.large_model_config.get("supports_prefix", True):
+                    # Use native prefix feature if supported
+                    extra_body["prefix"] = quick_response
+                else:
+                    # Fallback: Add prefix as assistant message for continuation
+                    enhanced_messages.append({"role": "assistant", "content": quick_response})
+                    # Add a hint in system message for smooth continuation
+                    enhanced_messages[0]["content"] += f"\n继续前面的回答，前面已经说了：'{quick_response}'，请自然地继续补充完整。"
 
             response = await self.large_client.chat.completions.create(
                 model=self.large_model_config["model"],
