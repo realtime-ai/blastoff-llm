@@ -1,0 +1,18 @@
+# Claude Multi-Agent Async System Dependencies
+
+# Anthropic SDK
+anthropic>=0.40.0
+
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-dotenv>=1.0.0
+
+# HTTP Client (for testing)
+httpx>=0.26.0
+
+# Pydantic (data validation)
+pydantic>=2.0.0
+
+# Optional: for more advanced features
+# claude-agent-sdk>=0.1.0  # 如果官方 SDK 可用
