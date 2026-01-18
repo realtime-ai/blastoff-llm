@@ -400,8 +400,36 @@ async def generate_stream(
     # 创建句子缓冲器
     buffer = SentenceBuffer(mode=request.stream_mode)
 
-    def make_chunk(content: str, phase: Optional[str] = None, finish: bool = False) -> str:
-        """创建 SSE chunk"""
+    # 句子索引计数器
+    sentence_index = 0
+
+    def make_chunk(
+        content: str,
+        finish: bool = False,
+        role: Optional[str] = None,
+        sentence_idx: Optional[int] = None,
+        is_fast: bool = False,
+        total_sentences: Optional[int] = None,
+    ) -> str:
+        """
+        创建 OpenAI 兼容的 SSE chunk
+
+        完全遵循 OpenAI API 规范：
+        https://platform.openai.com/docs/api-reference/chat/streaming
+
+        扩展字段使用 x_ 前缀，不影响标准解析：
+        - x_stream_mode: 当前流模式 (sentence/phrase/word)
+        - x_sentence_index: 句子索引（用于 TTS 排队）
+        - x_tts_priority: TTS 优先级 (high/normal)
+        - x_total_sentences: 完成时的总句子数
+        """
+        # 构建 delta 对象
+        delta = {}
+        if role:
+            delta["role"] = role
+        if content and not finish:
+            delta["content"] = content
+
         chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -409,17 +437,30 @@ async def generate_stream(
             "model": request.model,
             "choices": [{
                 "index": 0,
-                "delta": {} if finish else {"content": content},
+                "delta": delta,
                 "finish_reason": "stop" if finish else None
             }]
         }
-        if phase:
-            chunk["phase"] = phase
-        # 添加 stream_mode 信息
-        chunk["stream_mode"] = request.stream_mode.value
+
+        # OpenAI 兼容的扩展字段（使用 x_ 前缀）
+        # 客户端可以选择性使用这些字段
+        if request.stream_mode != StreamMode.TOKEN:
+            chunk["x_stream_mode"] = request.stream_mode.value
+
+            if sentence_idx is not None:
+                chunk["x_sentence_index"] = sentence_idx
+                # TTS 优先级：快速响应为 high，普通为 normal
+                chunk["x_tts_priority"] = "high" if is_fast else "normal"
+
+            if finish and total_sentences is not None:
+                chunk["x_total_sentences"] = total_sentences
+
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
     try:
+        # 发送初始 chunk（包含 role）
+        yield make_chunk("", role="assistant")
+
         async for event in orchestrator.process(user_message, conversation_history):
             if event.phase == ResponsePhase.FAST:
                 fast_response_ms = event.latency_ms
@@ -428,39 +469,48 @@ async def generate_stream(
                 # 刷新缓冲区中剩余的内容
                 remaining = buffer.flush()
                 if remaining:
-                    yield make_chunk(remaining, "full")
+                    yield make_chunk(remaining, sentence_idx=sentence_index)
+                    sentence_index += 1
 
                 # 记录统计
                 total_ms = event.latency_ms
                 stats.add_request(fast_response_ms, total_ms)
 
-                # 发送完成 chunk
-                yield make_chunk("", finish=True)
+                # 发送完成 chunk（包含总句子数）
+                yield make_chunk("", finish=True, total_sentences=sentence_index)
                 yield "data: [DONE]\n\n"
 
             elif event.content:
-                # 确定当前阶段
-                phase = None
                 if event.phase == ResponsePhase.FAST:
-                    phase = "fast"
-                    # Fast 响应总是立即输出（不经过缓冲）
-                    yield make_chunk(event.content, phase)
+                    # Fast 响应总是立即输出（不经过缓冲），标记为高优先级
+                    yield make_chunk(event.content, sentence_idx=sentence_index, is_fast=True)
+                    sentence_index += 1
                 elif event.phase == ResponsePhase.THINKING:
-                    phase = "thinking"
-                    # Thinking 内容也立即输出
-                    yield make_chunk(event.content, phase)
+                    # Thinking 内容也立即输出（如果启用了显示）
+                    yield make_chunk(event.content)
                 elif event.phase == ResponsePhase.FULL:
-                    phase = "full"
                     # Full 响应根据 stream_mode 决定输出方式
                     units = buffer.add(event.content)
                     for unit in units:
-                        yield make_chunk(unit, phase)
+                        yield make_chunk(unit, sentence_idx=sentence_index)
+                        sentence_index += 1
 
     except Exception as e:
+        # OpenAI 兼容的错误格式
         error_chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
-            "error": str(e)
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "error": {
+                "message": str(e),
+                "type": "server_error"
+            }
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -553,153 +603,56 @@ async def generate_complete(
     )
 
 
-# ========== TTS 友好的句子流端点 ==========
+# ========== 句子模式端点（OpenAI 兼容 + 扩展） ==========
 
 @app.post("/v1/chat/completions/sentences")
 async def chat_completions_sentences(request: ChatCompletionRequest):
     """
-    句子模式端点 - 专为 TTS 设计
+    句子模式端点 - OpenAI 兼容格式
 
-    返回格式（JSON Lines）：
-    {"type": "fast_response", "content": "好的，", "index": 0}
-    {"type": "sentence", "content": "让我来解释一下。", "index": 1}
-    {"type": "sentence", "content": "机器学习是人工智能的一个分支。", "index": 2}
-    {"type": "done", "total_sentences": 3}
+    返回标准 OpenAI SSE 格式，通过 x_ 扩展字段提供句子信息：
 
-    特点：
-    - 每个句子作为独立的 JSON 对象
-    - 包含句子索引，方便 TTS 排队
-    - Fast response 单独标记，可优先处理
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"role":"assistant"}}],...}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"好的，"}}],"x_sentence_index":0,"x_sentence_type":"fast"}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"让我解释一下。"}}],"x_sentence_index":1}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{},"finish_reason":"stop"}],"x_total_sentences":2}
+    data: [DONE]
+
+    扩展字段（x_ 前缀，可选使用）：
+    - x_sentence_index: 句子索引
+    - x_sentence_type: "fast" 表示快速响应
+    - x_total_sentences: 总句子数（在最后一个 chunk）
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
-    if not request.messages:
-        raise HTTPException(status_code=400, detail="Messages cannot be empty")
-
-    user_message = request.messages[-1].content
-    conversation_history = None
-    if len(request.messages) > 1:
-        conversation_history = [
-            {"role": m.role, "content": m.content}
-            for m in request.messages[:-1]
-        ]
-
-    orchestrator = MultiAgentOrchestrator(
-        api_key=api_key,
-        thinking_model=request.thinking_model,
-        show_thinking=request.show_thinking,
-    )
-
     # 强制使用句子模式
     request.stream_mode = StreamMode.SENTENCE
+    request.stream = True
 
-    async def generate_sentences():
-        sentence_index = 0
-
-        async for item in generate_stream_sentence(
-            orchestrator, user_message, conversation_history, request
-        ):
-            if item["type"] == "done":
-                yield json.dumps({
-                    "type": "done",
-                    "total_sentences": sentence_index
-                }, ensure_ascii=False) + "\n"
-            else:
-                yield json.dumps({
-                    "type": item["type"],
-                    "content": item["content"],
-                    "index": sentence_index,
-                    "phase": item.get("phase", "full")
-                }, ensure_ascii=False) + "\n"
-                sentence_index += 1
-
-    return StreamingResponse(
-        generate_sentences(),
-        media_type="application/x-ndjson",  # JSON Lines 格式
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+    # 复用主端点逻辑
+    return await chat_completions(request)
 
 
 @app.post("/v1/chat/completions/tts")
 async def chat_completions_tts(request: ChatCompletionRequest):
     """
-    TTS Pipeline 端点 - 返回适合直接送入 TTS 的数据
+    TTS 优化端点 - OpenAI 兼容格式 + TTS 扩展
 
-    返回格式（JSON Lines）：
-    {"text": "好的，", "priority": "high", "index": 0}
-    {"text": "让我来解释一下。", "priority": "normal", "index": 1}
-    {"text": "DONE", "priority": "end", "index": -1}
+    返回标准 OpenAI SSE 格式，通过 x_ 扩展字段提供 TTS 优先级：
 
-    特点：
-    - Fast response 标记为 high priority（可以立即开始 TTS）
-    - 普通句子标记为 normal priority
-    - 简化的数据结构，减少解析开销
+    data: {"choices":[{"delta":{"content":"好的，"}}],"x_tts_priority":"high","x_sentence_index":0}
+    data: {"choices":[{"delta":{"content":"让我解释。"}}],"x_tts_priority":"normal","x_sentence_index":1}
+    data: [DONE]
+
+    扩展字段：
+    - x_tts_priority: "high"（快速响应，立即播放）/ "normal"（普通句子）
+    - x_sentence_index: 句子索引，用于 TTS 排队
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
-    if not request.messages:
-        raise HTTPException(status_code=400, detail="Messages cannot be empty")
-
-    user_message = request.messages[-1].content
-    conversation_history = None
-    if len(request.messages) > 1:
-        conversation_history = [
-            {"role": m.role, "content": m.content}
-            for m in request.messages[:-1]
-        ]
-
-    orchestrator = MultiAgentOrchestrator(
-        api_key=api_key,
-        thinking_model=request.thinking_model,
-        show_thinking=False,  # TTS 不需要思考过程
-    )
-
+    # 强制使用句子模式，禁用思考显示
     request.stream_mode = StreamMode.SENTENCE
+    request.stream = True
+    request.show_thinking = False
 
-    async def generate_tts_stream():
-        index = 0
-
-        async for item in generate_stream_sentence(
-            orchestrator, user_message, conversation_history, request
-        ):
-            if item["type"] == "done":
-                yield json.dumps({
-                    "text": "DONE",
-                    "priority": "end",
-                    "index": -1
-                }, ensure_ascii=False) + "\n"
-            elif item["type"] == "fast_response":
-                yield json.dumps({
-                    "text": item["content"],
-                    "priority": "high",
-                    "index": index
-                }, ensure_ascii=False) + "\n"
-                index += 1
-            elif item["type"] == "sentence":
-                yield json.dumps({
-                    "text": item["content"],
-                    "priority": "normal",
-                    "index": index
-                }, ensure_ascii=False) + "\n"
-                index += 1
-
-    return StreamingResponse(
-        generate_tts_stream(),
-        media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+    # 复用主端点逻辑
+    return await chat_completions(request)
 
 
 # ========== 直接模式端点（用于对比测试）==========
