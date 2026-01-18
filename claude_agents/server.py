@@ -408,8 +408,6 @@ async def generate_stream(
         finish: bool = False,
         role: Optional[str] = None,
         sentence_idx: Optional[int] = None,
-        is_fast: bool = False,
-        total_sentences: Optional[int] = None,
     ) -> str:
         """
         创建 OpenAI 兼容的 SSE chunk
@@ -420,8 +418,6 @@ async def generate_stream(
         扩展字段使用 x_ 前缀，不影响标准解析：
         - x_stream_mode: 当前流模式 (sentence/phrase/word)
         - x_sentence_index: 句子索引（用于 TTS 排队）
-        - x_tts_priority: TTS 优先级 (high/normal)
-        - x_total_sentences: 完成时的总句子数
         """
         # 构建 delta 对象
         delta = {}
@@ -446,14 +442,8 @@ async def generate_stream(
         # 客户端可以选择性使用这些字段
         if request.stream_mode != StreamMode.TOKEN:
             chunk["x_stream_mode"] = request.stream_mode.value
-
             if sentence_idx is not None:
                 chunk["x_sentence_index"] = sentence_idx
-                # TTS 优先级：快速响应为 high，普通为 normal
-                chunk["x_tts_priority"] = "high" if is_fast else "normal"
-
-            if finish and total_sentences is not None:
-                chunk["x_total_sentences"] = total_sentences
 
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
@@ -476,14 +466,14 @@ async def generate_stream(
                 total_ms = event.latency_ms
                 stats.add_request(fast_response_ms, total_ms)
 
-                # 发送完成 chunk（包含总句子数）
-                yield make_chunk("", finish=True, total_sentences=sentence_index)
+                # 发送完成 chunk
+                yield make_chunk("", finish=True)
                 yield "data: [DONE]\n\n"
 
             elif event.content:
                 if event.phase == ResponsePhase.FAST:
-                    # Fast 响应总是立即输出（不经过缓冲），标记为高优先级
-                    yield make_chunk(event.content, sentence_idx=sentence_index, is_fast=True)
+                    # Fast 响应总是立即输出（不经过缓冲）
+                    yield make_chunk(event.content, sentence_idx=sentence_index)
                     sentence_index += 1
                 elif event.phase == ResponsePhase.THINKING:
                     # Thinking 内容也立即输出（如果启用了显示）
@@ -613,15 +603,14 @@ async def chat_completions_sentences(request: ChatCompletionRequest):
     返回标准 OpenAI SSE 格式，通过 x_ 扩展字段提供句子信息：
 
     data: {"id":"chatcmpl-xxx","choices":[{"delta":{"role":"assistant"}}],...}
-    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"好的，"}}],"x_sentence_index":0,"x_sentence_type":"fast"}
-    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"让我解释一下。"}}],"x_sentence_index":1}
-    data: {"id":"chatcmpl-xxx","choices":[{"delta":{},"finish_reason":"stop"}],"x_total_sentences":2}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"好的，"}}],"x_stream_mode":"sentence","x_sentence_index":0}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"让我解释一下。"}}],"x_stream_mode":"sentence","x_sentence_index":1}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{},"finish_reason":"stop"}]}
     data: [DONE]
 
     扩展字段（x_ 前缀，可选使用）：
+    - x_stream_mode: 流模式 (sentence)
     - x_sentence_index: 句子索引
-    - x_sentence_type: "fast" 表示快速响应
-    - x_total_sentences: 总句子数（在最后一个 chunk）
     """
     # 强制使用句子模式
     request.stream_mode = StreamMode.SENTENCE
@@ -634,17 +623,14 @@ async def chat_completions_sentences(request: ChatCompletionRequest):
 @app.post("/v1/chat/completions/tts")
 async def chat_completions_tts(request: ChatCompletionRequest):
     """
-    TTS 优化端点 - OpenAI 兼容格式 + TTS 扩展
+    TTS 优化端点 - OpenAI 兼容格式，按句子输出
 
-    返回标准 OpenAI SSE 格式，通过 x_ 扩展字段提供 TTS 优先级：
-
-    data: {"choices":[{"delta":{"content":"好的，"}}],"x_tts_priority":"high","x_sentence_index":0}
-    data: {"choices":[{"delta":{"content":"让我解释。"}}],"x_tts_priority":"normal","x_sentence_index":1}
-    data: [DONE]
+    与 /sentences 端点相同，但自动禁用 thinking 显示。
+    适合直接对接 TTS 系统。
 
     扩展字段：
-    - x_tts_priority: "high"（快速响应，立即播放）/ "normal"（普通句子）
-    - x_sentence_index: 句子索引，用于 TTS 排队
+    - x_stream_mode: 流模式 (sentence)
+    - x_sentence_index: 句子索引
     """
     # 强制使用句子模式，禁用思考显示
     request.stream_mode = StreamMode.SENTENCE
